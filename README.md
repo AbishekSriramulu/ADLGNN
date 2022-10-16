@@ -39,3 +39,8 @@ python train_single_step.py --save ./model-RE12.pt  --pretrained_model ./model-R
 
 ```
 
+
+
+
+## Acknowledgement
+Our implementation adapts the code [here](https://github.com/nnzhan/MTGNN) as the code base and extensively adapts it to our purpose. We thank the authors for sharing their code.

@@ -2,6 +2,10 @@
 *.pt
 *.pth
 
+# Text files (except requirements.txt)
+*.txt
+!requirements.txt
+
 # Python
 __pycache__/
 *.py[cod]

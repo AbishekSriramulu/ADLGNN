@@ -18,7 +18,7 @@ class DataLoaderS(object):
         self.rawdat = np.loadtxt(fin, delimiter=',')
         self.dat = np.zeros(self.rawdat.shape)
         self.n, self.m = self.dat.shape
-        self.normalize = 2
+        self.normalize = normalize
         self.scale = np.ones(self.m)
         self._normalized(normalize)
         self._split(int(train * self.n), int((train + valid) * self.n), self.n)
@@ -35,22 +35,18 @@ class DataLoaderS(object):
         self.device = device
 
     def _normalized(self, normalize):
-        # normalized by the maximum value of entire matrix.
-
-        if (normalize == 0):
+        if normalize == 0:
             self.dat = self.rawdat
-
-        if (normalize == 1):
+        elif normalize == 1:
             self.dat = self.rawdat / np.max(self.rawdat)
-
-        # normlized by the maximum value of each row(sensor).
-        if (normalize == 2):
+        elif normalize == 2:
             for i in range(self.m):
                 self.scale[i] = np.max(np.abs(self.rawdat[:, i]))
-                self.dat[:, i] = self.rawdat[:, i] / np.max(np.abs(self.rawdat[:, i]))
+                self.dat[:, i] = self.rawdat[:, i] / self.scale[i]
+        else:
+            raise ValueError(f"Invalid normalization type: {normalize}")
 
     def _split(self, train, valid, test):
-
         train_set = range(self.P + self.h - 1, train)
         valid_set = range(train, valid)
         test_set = range(valid, self.n)
@@ -61,12 +57,12 @@ class DataLoaderS(object):
     def _batchify(self, idx_set, horizon):
         n = len(idx_set)
         X = torch.zeros((n, self.P, self.m))
-        Y = torch.zeros((n, self.m))
+        Y = torch.zeros((n, horizon, self.m))
         for i in range(n):
-            end = idx_set[i] - self.h + 1
+            end = idx_set[i] - horizon + 1
             start = end - self.P
             X[i, :, :] = torch.from_numpy(self.dat[start:end, :])
-            Y[i, :] = torch.from_numpy(self.dat[idx_set[i], :])
+            Y[i, :, :] = torch.from_numpy(self.dat[end:end + horizon, :])
         return [X, Y]
 
     def get_batches(self, inputs, targets, batch_size, shuffle=True):
@@ -74,16 +70,13 @@ class DataLoaderS(object):
         if shuffle:
             index = torch.randperm(length)
         else:
-            index = torch.LongTensor(range(length))
+            index = torch.arange(length)
         start_idx = 0
         while (start_idx < length):
             end_idx = min(length, start_idx + batch_size)
-            excerpt = index[start_idx:end_idx]
-            X = inputs[excerpt]
-            Y = targets[excerpt]
-            X = X.to(self.device)
-            Y = Y.to(self.device)
-            yield Variable(X), Variable(Y)
+            x_batch = inputs[index[start_idx:end_idx]]
+            y_batch = targets[index[start_idx:end_idx]]
+            yield (x_batch, y_batch)
             start_idx += batch_size
 
 class DataLoaderM(object):

@@ -5,47 +5,43 @@ import matplotlib.pyplot as plt
 import itertools as it
 import pandas as pd
 import asyncio
+from reconstruction import BaseReconstructor, logger
+
+class OptimalCausationEntropyReconstructor(BaseReconstructor):
+    """Optimal causation entropy-based network reconstruction methods."""
+    
+    def __init__(self, data_ratio: float = 0.3, top_k: int = 5):  # Note: Using 0.3 as per original file
+        super().__init__(data_ratio, top_k)
+        self.recons = {
+            'OptimalCausationEntropy': netrd.reconstruction.OptimalCausationEntropy(),
+        }
 
 def background(f):
     def wrapped(*args, **kwargs):
         return asyncio.get_event_loop().run_in_executor(None, f, *args, **kwargs)
     return wrapped
 
-recons = {
-    
-    'OptimalCausationEntropy': netrd.reconstruction.OptimalCausationEntropy(),
-    }
+@background
+def process_dataset(path: str) -> None:
+    """Process a single dataset asynchronously."""
+    try:
+        reconstructor = OptimalCausationEntropyReconstructor()
+        reconstructor.reconstruct(f"data/{path}")
+    except Exception as e:
+        logger.error(f"Failed to process {path}: {str(e)}")
 
+def main():
+    """Main function to run optimal causation entropy-based reconstructions."""
+    datasets = [
+        "traffic.txt.gz",
+        "solar_AL.txt.gz",
+        "electricity.txt.gz",
+        "exchange_rate.txt.gz"
+    ]
     
-@background  
-def your_function(argument):
-    
-    df = pd.read_csv("data/" + path, header = None)
-    df = df[-int(len(df)*.3):]
-    print()
-    print()
-    print("working on dataset " + path)
-    # kwargs = {'threshold_type':'quantile', 'quantile':0.9}
-    # loop over all the reconstruction techniques
-    for ri, R1 in list(recons.items()):
-        print( "**** starting - " + str(ri) + " ********")
-        try:
-            R1.fit(np.array(df.T))
-            print( "**** Fit successful - " + str(ri) + " ********")
-            adj = pd.DataFrame(R1.results['thresholded_matrix']).abs()
-            adj.replace([np.inf, np.nan], 0.0, inplace=True)
-            adj.mask(adj.rank(axis=0, method='min', ascending=False) > 5, 0, inplace = True)  
-            adj.mask(adj.rank(axis=1, method='min', ascending=False) > 5, 0, inplace = True) 
-            adj.to_csv(path.split(".")[0]+"_"+ri+'.csv', index=False)
-            print( "**** file saved ********")
-            print()
-        except Exception as e:
-            print( "**** could not perform - " + str(ri) + " ********")
-            print(e)
-            print()
-            continue
-            
-# dictionary to store the outputs
-datasets= ["traffic.txt.gz", "solar_AL.txt.gz","electricity.txt.gz", "exchange_rate.txt.gz" ]
-for path in datasets:
-    your_function(path)
+    # Process datasets in parallel
+    tasks = [process_dataset(dataset) for dataset in datasets]
+    asyncio.get_event_loop().run_until_complete(asyncio.gather(*tasks))
+
+if __name__ == "__main__":
+    main()

@@ -12,20 +12,39 @@ import matplotlib.pyplot as plt
 from math import sqrt
 import os
 
+def init_weights(m):
+    """
+    Initialize network weights using Xavier/Glorot initialization
+    """
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.ones_(m.weight)
+        nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.ones_(m.weight)
+        nn.init.zeros_(m.bias)
+
 class BasicConv(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True, bn=True, bias=False):
+    def __init__(self, c_in, c_out, dropout=0.1):
         super(BasicConv, self).__init__()
-        self.out_channels = out_planes
-        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
-        self.bn = nn.BatchNorm2d(out_planes,eps=1e-5, momentum=0.01, affine=True) if bn else None
-        self.relu = nn.ReLU() if relu else None
+        self.conv = nn.Conv2d(c_in, c_out, 3, padding=1)
+        self.bn = nn.BatchNorm2d(c_out)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout)
+        self.apply(init_weights)
 
     def forward(self, x):
         x = self.conv(x)
-        if self.bn is not None:
-            x = self.bn(x)
-        if self.relu is not None:
-            x = self.relu(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.dropout(x)
         return x
 
 class ZPool(nn.Module):
@@ -33,40 +52,46 @@ class ZPool(nn.Module):
         return torch.cat( (torch.max(x,1)[0].unsqueeze(1), torch.mean(x,1).unsqueeze(1)), dim=1)
 
 class AttentionGate(nn.Module):
-    def __init__(self, bn=True):
+    def __init__(self, F_g, F_l, F_int, dropout=0.1):
         super(AttentionGate, self).__init__()
-        kernel_size = 7
-        self.compress = ZPool()
-        self.conv = BasicConv(2, 1, kernel_size, stride=1, padding=(kernel_size-1) // 2, relu=False, bn=bn)
-    def forward(self, x):
-        x_compress = self.compress(x)
-        x_out = self.conv(x_compress)
-        scale = torch.sigmoid_(x_out) 
-        return x * scale
+        self.W_g = nn.Conv2d(F_g, F_int, 1)
+        self.W_x = nn.Conv2d(F_l, F_int, 1)
+        self.psi = nn.Conv2d(F_int, 1, 1)
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.01)
+        self.dropout = nn.Dropout(dropout)
+        self.apply(init_weights)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.leaky_relu(g1 + x1)
+        psi = self.psi(psi)
+        psi = self.dropout(psi)
+        return x * psi
 
 class TripletAttention(nn.Module):
-    def __init__(self, no_spatial=False, bn=True):
+    def __init__(self, no_spatial=False, dropout=0.1):
         super(TripletAttention, self).__init__()
-        self.cw = AttentionGate(bn=bn)
-        self.hc = AttentionGate(bn=bn)
-        self.no_spatial=no_spatial
+        self.cw = AttentionGate(256, 256, 128, dropout)
+        self.hc = AttentionGate(256, 256, 128, dropout)
+        self.no_spatial = no_spatial
         if not no_spatial:
-            self.hw = AttentionGate(bn=bn)
+            self.hw = AttentionGate(256, 256, 128, dropout)
+        self.apply(init_weights)
+
     def forward(self, x):
-        x_perm1 = x.permute(0,2,1,3).contiguous()
+        x_perm1 = x.permute(0, 2, 1, 3)
         x_out1 = self.cw(x_perm1)
-        x_out11 = x_out1.permute(0,2,1,3).contiguous()
-        x_perm2 = x.permute(0,3,2,1).contiguous()
+        x_out11 = x_out1.permute(0, 2, 1, 3)
+        x_perm2 = x.permute(0, 3, 2, 1)
         x_out2 = self.hc(x_perm2)
-        x_out21 = x_out2.permute(0,3,2,1).contiguous()
+        x_out21 = x_out2.permute(0, 3, 2, 1)
         if not self.no_spatial:
             x_out = self.hw(x)
             x_out = 1/3 * (x_out + x_out11 + x_out21)
         else:
             x_out = 1/2 * (x_out11 + x_out21)
         return x_out
-
-
 
 class moving_avg(nn.Module):
     """
@@ -96,68 +121,24 @@ class MFIn(nn.Module):
     Denormalisation  
     in, out shape (batch_size, num_nodes, output_window)
     """
-    def __init__(self,num_nodes, num_features: int, eps=1e-5, affine=True, tanh_est=True):
-        """
-        :param num_nodes: the number of nodes
-        :param num_features: the number of features
-        :param eps: a value added for numerical stability
-        :param affine: if True, MFIn will have learnable affine parameters
-        """
+    def __init__(self, num_nodes, num_timesteps_input, num_timesteps_output, dropout=0.1):
         super(MFIn, self).__init__()
-        self.num_features = num_features
-        self.N = num_nodes
-        self.eps = eps
-        self.affine = affine
-        self.tanh_est = tanh_est
-        if self.affine:
-            self._init_params()
+        self.num_nodes = num_nodes
+        self.num_timesteps_input = num_timesteps_input
+        self.num_timesteps_output = num_timesteps_output
+        self.dropout = nn.Dropout(dropout)
+        self.apply(init_weights)
 
-    def forward(self, x, mode:str):
-        if mode == 'norm':
-            self._get_statistics(x)
-            x = self._normalize(x)
-        elif mode == 'denorm':
-            x = self._denormalize(x)
-        else: raise NotImplementedError
+    def forward(self, x):
+        # Normalize input
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True)
+        x = (x - mean) / (std + 1e-8)
+        x = self.dropout(x)
         return x
 
-    def _init_params(self):
-        # initialize RevIN params: (F,N,1) #
-        self.affine_weight = nn.Parameter(torch.ones(self.num_features, self.N,1))
-        self.affine_bias = nn.Parameter(torch.zeros(self.num_features, self.N,1))
-
-    def _get_statistics(self, x):
-        dim2reduce = (3) #input length dimension
-        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
-        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
-
-    def _normalize(self, x):
-        if self.tanh_est:
-            x = 0.5 * (torch.tanh(0.01 * ((x - self.mean) / self.stdev)) + 1 )
-        else:
-            x = x - self.mean
-            x = x / self.stdev
-        if self.affine:
-            x = x * self.affine_weight
-            x = x + self.affine_bias
-        return x
-
-    def _denormalize(self, x):
-        if self.affine:
-            x = x - self.affine_bias[1,:,:]
-            x = x / (self.affine_weight[1,:,:] + self.eps*self.eps)
-        if self.tanh_est:
-            x = (x / 0.5) - 1
-            x = (torch.arctanh(x))
-            x = x / 0.01
-            x = ( (  ( x ) * self.stdev[:,1,:,:]) + self.mean[:,1,:,:])
-            x = torch.round(x, decimals=6)
-        else:
-            x = x * self.stdev[:,1,:,:]
-            x = x + self.mean[:,1,:,:]
-        return x
-
-
+    def denormalize(self, x, mean, std):
+        return x * std + mean
 
 class series_decomp(nn.Module):
     """
@@ -203,21 +184,75 @@ class decom_2D(nn.Module):
 
 
 
-class nconv(nn.Module):
+class NConv(nn.Module):
     def __init__(self):
-        super(nconv,self).__init__()
+        super(NConv, self).__init__()
+        self.chunk_size = 1000  # Process data in chunks for memory efficiency
 
-    def forward(self,x, A):
-        x = torch.einsum('ncvl,vw->ncwl',(x,A))
-        return x.contiguous()
+    def forward(self, x, adj):
+        """
+        Memory-efficient graph convolution operation
+        Args:
+            x(torch.tensor): (B, input_channels, N, T)
+            adj(torch.tensor): N * N
+        Returns:
+            torch.tensor: (B, input_channels, N, T)
+        """
+        try:
+            batch_size, channels, nodes, time = x.size()
+            
+            # Process in chunks to save memory
+            if nodes > self.chunk_size:
+                chunks = []
+                for i in range(0, nodes, self.chunk_size):
+                    end = min(i + self.chunk_size, nodes)
+                    chunk_x = x[:, :, i:end, :]
+                    chunk_adj = adj[i:end, :]
+                    chunk_result = torch.einsum('ncwl,vw->ncvl', (chunk_x, chunk_adj))
+                    chunks.append(chunk_result)
+                x = torch.cat(chunks, dim=2)
+            else:
+                x = torch.einsum('ncwl,vw->ncvl', (x, adj))
+            
+            return x.contiguous()
+        except Exception as e:
+            print(f"Error in NConv: {str(e)}")
+            raise
 
 class dy_nconv(nn.Module):
     def __init__(self):
-        super(dy_nconv,self).__init__()
+        super(dy_nconv, self).__init__()
+        self.chunk_size = 1000  # Process data in chunks for memory efficiency
 
-    def forward(self,x, A):
-        x = torch.einsum('ncvl,nvwl->ncwl',(x,A))
-        return x.contiguous()
+    def forward(self, x, A):
+        """
+        Memory-efficient dynamic graph convolution operation
+        Args:
+            x(torch.tensor): (B, input_channels, N, T)
+            A(torch.tensor): (B, N, N, T)
+        Returns:
+            torch.tensor: (B, input_channels, N, T)
+        """
+        try:
+            batch_size, channels, nodes, time = x.size()
+            
+            # Process in chunks to save memory
+            if nodes > self.chunk_size:
+                chunks = []
+                for i in range(0, nodes, self.chunk_size):
+                    end = min(i + self.chunk_size, nodes)
+                    chunk_x = x[:, :, i:end, :]
+                    chunk_A = A[:, i:end, :, :]
+                    chunk_result = torch.einsum('ncvl,nvwl->ncwl', (chunk_x, chunk_A))
+                    chunks.append(chunk_result)
+                x = torch.cat(chunks, dim=2)
+            else:
+                x = torch.einsum('ncvl,nvwl->ncwl', (x, A))
+            
+            return x.contiguous()
+        except Exception as e:
+            print(f"Error in dy_nconv: {str(e)}")
+            raise
 
 class linear(nn.Module):
     def __init__(self,c_in,c_out,bias=True):
@@ -457,51 +492,37 @@ class graph_attention_constructor(nn.Module):
             self.emb2 = nn.Embedding(nnodes, dim)
             self.lin1 = nn.Linear(dim,dim)
             self.lin2 = nn.Linear(dim,dim)
-            self.mha = MultiHeadAttention(1, dim, 40, 40)
+
         self.device = device
         self.k = k
         self.dim = dim
         self.alpha = alpha
         self.static_feat = static_feat
+        self.dropout = nn.Dropout(0.1)  # Add dropout for regularization
 
     def forward(self, idx):
-        if self.static_feat is None:
-            nodevec1, attn_weights = self.mha(self.emb1(idx).unsqueeze(0), self.emb1(idx).unsqueeze(0), self.emb1(idx).unsqueeze(0))
-            nodevec1 = nodevec1.squeeze(0)
-            nodevec2 = self.emb2(idx)
-        else:
-            nodevec1 = self.static_feat[idx,:]
-            nodevec2 = nodevec1
+        try:
+            if self.static_feat is None:
+                nodevec1 = self.emb1(idx)
+                nodevec2 = self.emb2(idx)
+            else:
+                if idx.max() >= self.static_feat.size(0):
+                    raise ValueError(f"Index {idx.max()} out of bounds for static features of size {self.static_feat.size(0)}")
+                nodevec1 = self.static_feat[idx,:]
+                nodevec2 = nodevec1
 
-        nodevec1 = torch.tanh(self.alpha*self.lin1(nodevec1))
-        nodevec2 = torch.tanh(self.alpha*self.lin2(nodevec2))
+            nodevec1 = torch.tanh(self.alpha*self.lin1(nodevec1))
+            nodevec2 = torch.tanh(self.alpha*self.lin2(nodevec2))
 
-        a = torch.mm(nodevec1, nodevec2.transpose(1,0))-torch.mm(nodevec2, nodevec1.transpose(1,0))
-        adj = F.relu(torch.tanh(self.alpha*a))
-        mask = torch.zeros(idx.size(0), idx.size(0)).to(self.device)
-        mask.fill_(float('0'))
-        s1,t1 = adj.topk(self.k,1)
-        mask.scatter_(1,t1,s1.fill_(1))
-        adj = adj*mask
-        return adj
-
-    def fullA(self, idx):
-        if self.static_feat is None:
-            nodevec1 = self.emb1(idx)
-            nodevec2 = self.emb2(idx)
-        else:
-            nodevec1 = self.static_feat[idx,:]
-            nodevec2 = nodevec1
-
-        nodevec1 = torch.tanh(self.alpha*self.lin1(nodevec1))
-        nodevec2 = torch.tanh(self.alpha*self.lin2(nodevec2))
-
-        a = torch.mm(nodevec1, nodevec2.transpose(1,0))-torch.mm(nodevec2, nodevec1.transpose(1,0))
-        adj = F.relu(torch.tanh(self.alpha*a))
-        return adj
+            a = torch.mm(nodevec1, nodevec2.transpose(1,0))-torch.mm(nodevec2, nodevec1.transpose(1,0))
+            adj = F.relu(torch.tanh(self.alpha*a))
+            adj = self.dropout(adj)  # Apply dropout
+            return adj
+        except Exception as e:
+            print(f"Error in graph_attention_constructor: {str(e)}")
+            raise
 
 class graph_constructor(nn.Module):
-                        #137  20  40
     def __init__(self, nnodes, k, dim, device, alpha=3, static_feat=None):
         super(graph_constructor, self).__init__()
         self.nnodes = nnodes
@@ -520,41 +541,35 @@ class graph_constructor(nn.Module):
         self.dim = dim
         self.alpha = alpha
         self.static_feat = static_feat
+        self.dropout = nn.Dropout(0.1)  # Add dropout for regularization
 
     def forward(self, idx):
-        if self.static_feat is None:
-            nodevec1 = self.emb1(idx)
-            nodevec2 = self.emb2(idx)
-        else:
-            nodevec1 = self.static_feat[idx,:]
-            nodevec2 = nodevec1
+        try:
+            if self.static_feat is None:
+                nodevec1 = self.emb1(idx)
+                nodevec2 = self.emb2(idx)
+            else:
+                if idx.max() >= self.static_feat.size(0):
+                    raise ValueError(f"Index {idx.max()} out of bounds for static features of size {self.static_feat.size(0)}")
+                nodevec1 = self.static_feat[idx,:]
+                nodevec2 = nodevec1
 
-        nodevec1 = torch.tanh(self.alpha*self.lin1(nodevec1))
-        nodevec2 = torch.tanh(self.alpha*self.lin2(nodevec2))
+            nodevec1 = torch.tanh(self.alpha*self.lin1(nodevec1))
+            nodevec2 = torch.tanh(self.alpha*self.lin2(nodevec2))
 
-        a = torch.mm(nodevec1, nodevec2.transpose(1,0))-torch.mm(nodevec2, nodevec1.transpose(1,0))
-        adj = F.relu(torch.tanh(self.alpha*a))
-        mask = torch.zeros(idx.size(0), idx.size(0)).to(self.device)
-        mask.fill_(float('0'))
-        s1,t1 = adj.topk(self.k,1)
-        mask.scatter_(1,t1,s1.fill_(1))
-        adj = adj*mask
-        return adj
-
-    def fullA(self, idx):
-        if self.static_feat is None:
-            nodevec1 = self.emb1(idx)
-            nodevec2 = self.emb2(idx)
-        else:
-            nodevec1 = self.static_feat[idx,:]
-            nodevec2 = nodevec1
-
-        nodevec1 = torch.tanh(self.alpha*self.lin1(nodevec1))
-        nodevec2 = torch.tanh(self.alpha*self.lin2(nodevec2))
-
-        a = torch.mm(nodevec1, nodevec2.transpose(1,0))-torch.mm(nodevec2, nodevec1.transpose(1,0))
-        adj = F.relu(torch.tanh(self.alpha*a))
-        return adj
+            a = torch.mm(nodevec1, nodevec2.transpose(1,0))-torch.mm(nodevec2, nodevec1.transpose(1,0))
+            adj = F.relu(torch.tanh(self.alpha*a))
+            adj = self.dropout(adj)  # Apply dropout
+            
+            mask = torch.zeros(idx.size(0), idx.size(0)).to(self.device)
+            mask.fill_(float('0'))
+            s1,t1 = adj.topk(self.k,1)
+            mask.scatter_(1,t1,s1.fill_(1))
+            adj = adj*mask
+            return adj
+        except Exception as e:
+            print(f"Error in graph_constructor: {str(e)}")
+            raise
 
 class graph_global(nn.Module):
     def __init__(self, nnodes, k, dim, device, alpha=3, static_feat=None):
@@ -662,7 +677,7 @@ class LayerNorm(nn.Module):
             self.register_parameter('weight', None)
             self.register_parameter('bias', None)
         self.reset_parameters()
-
+        self.grad_clip = 1.0  # Add gradient clipping value
 
     def reset_parameters(self):
         if self.elementwise_affine:
@@ -670,10 +685,26 @@ class LayerNorm(nn.Module):
             init.zeros_(self.bias)
 
     def forward(self, input, idx):
-        if self.elementwise_affine:
-            return F.layer_norm(input, tuple(input.shape[1:]), self.weight[:,idx,:], self.bias[:,idx,:], self.eps)
-        else:
-            return F.layer_norm(input, tuple(input.shape[1:]), self.weight, self.bias, self.eps)
+        try:
+            if self.elementwise_affine:
+                # Clip gradients during forward pass
+                if self.weight.requires_grad:
+                    self.weight.grad = torch.clamp(self.weight.grad, -self.grad_clip, self.grad_clip)
+                if self.bias.requires_grad:
+                    self.bias.grad = torch.clamp(self.bias.grad, -self.grad_clip, self.grad_clip)
+                
+                return F.layer_norm(input, tuple(input.shape[1:]), 
+                                  self.weight[:,idx,:], 
+                                  self.bias[:,idx,:], 
+                                  self.eps)
+            else:
+                return F.layer_norm(input, tuple(input.shape[1:]), 
+                                  self.weight, 
+                                  self.bias, 
+                                  self.eps)
+        except Exception as e:
+            print(f"Error in LayerNorm: {str(e)}")
+            raise
 
     def extra_repr(self):
         return '{normalized_shape}, eps={eps}, ' \
@@ -686,34 +717,6 @@ class Linear(nn.Module):
 
     def forward(self, x):
         return self.mlp(x)
-
-class NConv(nn.Module):
-    def __init__(self):
-        super(NConv, self).__init__()
-
-    def forward(self, x, adj):
-        """
-        A * X
-
-        Args:
-            x(torch.tensor):  (B, input_channels, N, T)
-            adj(torch.tensor):  N * N
-
-        Returns:
-            torch.tensor: (B, input_channels, N, T)
-        """
-        x = torch.einsum('ncwl,vw->ncvl', (x, adj))
-        return x.contiguous()
-    
-
-
-
-import numpy as np
-import torch
-from torch import nn
-from torch.nn import init
-
-
 
 class SEAttention(nn.Module):
 
